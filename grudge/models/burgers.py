@@ -1,8 +1,4 @@
-# -*- coding: utf8 -*-
 """Burgers operator."""
-
-from __future__ import division
-from __future__ import absolute_import
 
 __copyright__ = "Copyright (C) 2009 Andreas Kloeckner"
 
@@ -26,40 +22,76 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 """
 
+import numpy as np
+import numpy.linalg as la
 
-
-
+from grudge.second_order import IPDGSecondDerivative
 from grudge.models import HyperbolicOperator
-import numpy
-from grudge.second_order import CentralSecondDerivative
-
-
+from grudge import sym
 
 
 class BurgersOperator(HyperbolicOperator):
-    def __init__(self, dimensions, viscosity=None, 
-            viscosity_scheme=CentralSecondDerivative()):
-        # yes, you read that right--no BCs, 1D only.
-        # (well--you can run the operator on a 2D grid. If you must.)
-        self.dimensions = dimensions
+    def __init__(self, ambient_dim,
+            flux_type=None,
+            quad_tag=None,
+            bc=None,
+            viscosity=None,
+            viscosity_scheme=None):
+        super().__init__()
+        assert self.ambient_dim == 1
+
+        if viscosity_scheme is None:
+            viscosity_scheme = IPDGSecondDerivative()
+
+        if flux_type is None:
+            flux_type = "lf"
+
+        self.ambient_dim = ambient_dim
+
+        self.flux_type = flux_type
+        self.quad_tag = quad_tag
+        self.bc = bc
+
         self.viscosity = viscosity
         self.viscosity_scheme = viscosity_scheme
 
-    def characteristic_velocity_optemplate(self, field):
-        from grudge.symbolic.operators import (
-                ElementwiseMaxOperator)
-        return ElementwiseMaxOperator()(field**2)**0.5
+    def flux(self, w):
+        return w**2 / 2
 
-    def bind_characteristic_velocity(self, discr):
-        from grudge.symbolic import Field
-        compiled = discr.compile(
-                self.characteristic_velocity_optemplate(
-                    Field("u")))
+    def weak_flux(self, w):
+        pass
 
-        def do(u):
-            return compiled(u=u)
+    def sym_variable(self, name="u", dd=None):
+        if self.ambient_dim == 1:
+            return sym.var(name, dd=dd)
 
-        return do
+        return sym.make_sym_array(name, self.ambient_dim, dd=dd)
+
+    def sym_operator(self, u):
+        def flux(pair):
+            return sym.project(pair.dd, face_dd)(self.weak_flux(pair))
+
+        face_dd = sym.DOFDesc(sym.FACE_RESTR_ALL, self.quad_tag)
+        boundary_dd = sym.DOFDesc(sym.BTAG_ALL, self.quad_tag)
+        quad_dd = sym.DOFDesc(sym.DTAG_VOLUME_ALL, self.quad_tag)
+
+        quad_u = sym.project(sym.DD_VOLUME, quad_dd)(u)
+        stiff_t = sym.stiffness_t(self.ambient_dim,
+                dd_in=quad_dd, dd_out=sym.DD_VOLUME)
+
+        if self.viscosity is None:
+            viscosity = 0
+        else:
+            raise NotImplementedError
+
+        return -sym.InverseMassOperator()(
+                sum(sym.stiff_t[n](self.flux(quad_u))
+                    for n in range(self.ambient_dim))
+                + sym.FaceMassOperator(face_dd, sym.DD_VOLUME)(
+                    flux(sym.int_tpair(u, self.quad_tag))
+                    + flux(sym.bc_tpair(boundary_dd, u, self.bc))
+                    )
+                )
 
     def sym_operator(self, with_sensor):
         from grudge.symbolic import (
@@ -95,8 +127,8 @@ class BurgersOperator(HyperbolicOperator):
         num_flux = make_lax_friedrichs_flux(
                 #u0,
                 to_if_quad(emax_u),
-                make_obj_array([to_if_quad(u)]), 
-                [make_obj_array([flux(to_if_quad(u))])], 
+                make_obj_array([to_if_quad(u)]),
+                [make_obj_array([flux(to_if_quad(u))])],
                 [], strong=False)[0]
 
         from grudge.second_order import SecondDerivativeTarget
@@ -136,20 +168,5 @@ class BurgersOperator(HyperbolicOperator):
         return m_inv((minv_st[0](flux(to_quad(u)))) - num_flux) \
                 + viscosity_bit
 
-    def bind(self, discr, u0=1, sensor=None):
-        compiled_sym_operator = discr.compile(
-                self.sym_operator(with_sensor=sensor is not None))
-
-        from grudge.mesh import check_bc_coverage
-        check_bc_coverage(discr.mesh, [])
-
-        def rhs(t, u):
-            kwargs = {}
-            if sensor is not None:
-                kwargs["sensor"] = sensor(u)
-            return compiled_sym_operator(u=u, u0=u0, **kwargs)
-
-        return rhs
-
     def max_eigenvalue(self, t=None, fields=None, discr=None):
-        return discr.nodewise_max(fields)
+        return sym.NodalMax()(sym.fabs(fields))
